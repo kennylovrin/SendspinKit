@@ -86,7 +86,8 @@ class PCMDecoder: AudioDecoder {
 
 /// Wrapper for a single compressed packet so `AVAudioConverter`'s `@Sendable`
 /// input closure can vend it once. `@unchecked Sendable` is safe: the instance
-/// is allocated in `decode()` and never escapes that synchronous call.
+/// is allocated in `decode()` and never escapes that synchronous call. The wrapped
+/// buffer is the decoder's reused one; it is only touched inside that call too.
 private final class OpusPacketInput: @unchecked Sendable {
     private let buffer: AVAudioCompressedBuffer
     private var consumed = false
@@ -122,6 +123,10 @@ final class OpusDecoder: AudioDecoder {
     private let compressedFormat: AVAudioFormat
     private let pcmFormat: AVAudioFormat
     private let converter: AVAudioConverter
+    /// Reused across packets (one decoder per stream, actor-confined) instead of
+    /// allocating ~16 KB in and ~46 KB out for every 20 ms packet.
+    private let compressedBuffer: AVAudioCompressedBuffer
+    private let pcmBuffer: AVAudioPCMBuffer
     private var int32Buffer: [Int32] = []
 
     init(sampleRate: Int, channels: Int, bitDepth _: Int) throws {
@@ -158,21 +163,31 @@ final class OpusDecoder: AudioDecoder {
             throw AudioDecoderError.formatCreationFailed("AVAudioConverter for Opus")
         }
         self.converter = converter
+
+        compressedBuffer = AVAudioCompressedBuffer(
+            format: compressedFormat,
+            packetCapacity: 1,
+            maximumPacketSize: Self.maximumOpusPacketBytes
+        )
+
+        // RFC 6716 caps a single Opus packet at 120 ms; size for that worst case.
+        guard let pcmBuffer = AVAudioPCMBuffer(
+            pcmFormat: pcmFormat,
+            frameCapacity: AVAudioFrameCount(sampleRate * 120 / 1_000)
+        ) else {
+            throw AudioDecoderError.conversionFailed("Opus PCM output buffer allocation")
+        }
+        self.pcmBuffer = pcmBuffer
     }
 
     func decode(_ data: Data) throws -> Data {
         guard !data.isEmpty else { return Data() }
 
-        // The buffer below is sized from `data.count`, so bound it before allocating.
+        // The reused input buffer holds at most `maximumOpusPacketBytes`.
         guard data.count <= Self.maximumOpusPacketBytes else {
             throw AudioDecoderError.inputTooLarge(bytes: data.count, limit: Self.maximumOpusPacketBytes)
         }
 
-        let compressedBuffer = AVAudioCompressedBuffer(
-            format: compressedFormat,
-            packetCapacity: 1,
-            maximumPacketSize: data.count
-        )
         compressedBuffer.byteLength = UInt32(data.count)
         compressedBuffer.packetCount = 1
         data.copyBytes(
@@ -189,14 +204,7 @@ final class OpusDecoder: AudioDecoder {
             mDataByteSize: UInt32(data.count)
         )
 
-        // RFC 6716 caps a single Opus packet at 120 ms; size for that worst case.
-        let maxFrames = sampleRate * 120 / 1_000
-        guard let pcmBuffer = AVAudioPCMBuffer(
-            pcmFormat: pcmFormat,
-            frameCapacity: AVAudioFrameCount(maxFrames)
-        ) else {
-            throw AudioDecoderError.conversionFailed("Opus PCM output buffer allocation")
-        }
+        pcmBuffer.frameLength = 0
 
         let input = OpusPacketInput(compressedBuffer)
         var conversionError: NSError?

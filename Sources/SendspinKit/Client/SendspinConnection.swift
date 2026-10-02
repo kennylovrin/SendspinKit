@@ -105,6 +105,9 @@ actor SendspinConnection {
         let nonceBOverride: Data?
         let pairingHandshakeHashOverride: Data?
         let pairingScalarBOverride: Data?
+    #else
+        /// Test hook, compiled out of release builds; `CPace` ignores it there too.
+        var pairingScalarBOverride: Data? { nil }
     #endif
     var sessionContext: ActivationAdmissibility.SessionContext
     let identityPrivateKey: Curve25519.KeyAgreement.PrivateKey
